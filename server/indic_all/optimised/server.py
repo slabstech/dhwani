@@ -1,30 +1,25 @@
-import torch
-import nemo.collections.asr as nemo_asr
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Depends, Body, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from pydub import AudioSegment
 import os
 import tempfile
-import subprocess
 import io
 import logging
 from logging.handlers import RotatingFileHandler
 from time import time, perf_counter
-from typing import List, Dict, OrderedDict, Annotated, Any
+from typing import List, Dict, Annotated, Any
 import argparse
 import uvicorn
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-from IndicTransToolkit import IndicProcessor
-from contextlib import asynccontextmanager
 import zipfile
 import soundfile as sf
-from parler_tts import ParlerTTSForConditionalGeneration
-from transformers import AutoTokenizer, AutoFeatureExtractor, set_seed
 import numpy as np
+from contextlib import asynccontextmanager
 from tts_config import SPEED, ResponseFormat, config
 from logger import logger
+from asr_manager import ASRModelManager
+from tts_manager import TTSModelManager, lifespan
+from translate_manager import ModelManager, ip
 
 # Configure logging with log rotation
 logging.basicConfig(
@@ -36,195 +31,20 @@ logging.basicConfig(
     ]
 )
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
 # Allow requests from your Gradio Space’s domain
 origins = [
     "https://gaganyatri-dhwani-voice-model.hf.space/",
     "https://gaganyatri-dhwani-voice-to-any.hf.space/",
-    "https://gaganyatri-dhwani-tts.hf.space/",
+        "https://gaganyatri-dhwani-tts.hf.space/",
     "https://gaganyatri-dhwani.hf.space/"
       # Replace with your Gradio Space URL
     "http://localhost:7860",  # For local testing
 ]
 
-
-# ASR Model Manager
-class ASRModelManager:
-    def __init__(self, default_language="kn", device_type="cuda"):
-        self.default_language = default_language
-        self.device_type = device_type
-        self.model_language = {
-            "kannada": "kn",
-            "hindi": "hi",
-            "malayalam": "ml",
-            "assamese": "as",
-            "bengali": "bn",
-            "bodo": "brx",
-            "dogri": "doi",
-            "gujarati": "gu",
-            "kashmiri": "ks",
-            "konkani": "kok",
-            "maithili": "mai",
-            "manipuri": "mni",
-            "marathi": "mr",
-            "nepali": "ne",
-            "odia": "or",
-            "punjabi": "pa",
-            "sanskrit": "sa",
-            "santali": "sat",
-            "sindhi": "sd",
-            "tamil": "ta",
-            "telugu": "te",
-            "urdu": "ur"
-        }
-        self.config_models = {
-            "as": "ai4bharat/indicconformer_stt_as_hybrid_rnnt_large",
-            "bn": "ai4bharat/indicconformer_stt_bn_hybrid_rnnt_large",
-            "brx": "ai4bharat/indicconformer_stt_brx_hybrid_rnnt_large",
-            "doi": "ai4bharat/indicconformer_stt_doi_hybrid_rnnt_large",
-            "gu": "ai4bharat/indicconformer_stt_gu_hybrid_rnnt_large",
-            "hi": "ai4bharat/indicconformer_stt_hi_hybrid_rnnt_large",
-            "kn": "ai4bharat/indicconformer_stt_kn_hybrid_rnnt_large",
-            "ks": "ai4bharat/indicconformer_stt_ks_hybrid_rnnt_large",
-            "kok": "ai4bharat/indicconformer_stt_kok_hybrid_rnnt_large",
-            "mai": "ai4bharat/indicconformer_stt_mai_hybrid_rnnt_large",
-            "ml": "ai4bharat/indicconformer_stt_ml_hybrid_rnnt_large",
-            "mni": "ai4bharat/indicconformer_stt_mni_hybrid_rnnt_large",
-            "mr": "ai4bharat/indicconformer_stt_mr_hybrid_rnnt_large",
-            "ne": "ai4bharat/indicconformer_stt_ne_hybrid_rnnt_large",
-            "or": "ai4bharat/indicconformer_stt_or_hybrid_rnnt_large",
-            "pa": "ai4bharat/indicconformer_stt_pa_hybrid_rnnt_large",
-            "sa": "ai4bharat/indicconformer_stt_sa_hybrid_rnnt_large",
-            "sat": "ai4bharat/indicconformer_stt_sat_hybrid_rnnt_large",
-            "sd": "ai4bharat/indicconformer_stt_sd_hybrid_rnnt_large",
-            "ta": "ai4bharat/indicconformer_stt_ta_hybrid_rnnt_large",
-            "te": "ai4bharat/indicconformer_stt_te_hybrid_rnnt_large",
-            "ur": "ai4bharat/indicconformer_stt_ur_hybrid_rnnt_large"
-        }
-        self.model = self.load_model(self.default_language)
-
-    def load_model(self, language_id="kn"):
-        model_name = self.config_models.get(language_id, self.config_models["kn"])
-        
-        model = nemo_asr.models.ASRModel.from_pretrained(model_name)
-        
-
-        device = torch.device(self.device_type if torch.cuda.is_available() and self.device_type == "cuda" else "cpu")
-        model.freeze() # inference mode
-        model = model.to(device) # transfer model to device
-
-        return model
-
-    def split_audio(self, file_path, chunk_duration_ms=15000):
-        """
-        Splits an audio file into chunks of specified duration if the audio duration exceeds the chunk duration.
-
-        :param file_path: Path to the audio file.
-        :param chunk_duration_ms: Duration of each chunk in milliseconds (default is 15000 ms or 15 seconds).
-        """
-        # Load the audio file
-        audio = AudioSegment.from_file(file_path)
-
-        # Get the duration of the audio in milliseconds
-        duration_ms = len(audio)
-
-        # Check if the duration is more than the specified chunk duration
-        if duration_ms > chunk_duration_ms:
-            # Calculate the number of chunks needed
-            num_chunks = duration_ms // chunk_duration_ms
-            if duration_ms % chunk_duration_ms != 0:
-                num_chunks += 1
-
-            # Split the audio into chunks
-            chunks = [audio[i*chunk_duration_ms:(i+1)*chunk_duration_ms] for i in range(num_chunks)]
-
-            # Create a directory to save the chunks
-            output_dir = "audio_chunks"
-            os.makedirs(output_dir, exist_ok=True)
-
-            # Export each chunk to separate files
-            chunk_file_paths = []
-            for i, chunk in enumerate(chunks):
-                chunk_file_path = os.path.join(output_dir, f"chunk_{i}.wav")
-                chunk.export(chunk_file_path, format="wav")
-                chunk_file_paths.append(chunk_file_path)
-                print(f"Chunk {i} exported successfully to {chunk_file_path}.")
-
-            return chunk_file_paths
-        else:
-            return [file_path]
-
-# Translation Model Manager
-class TranslateManager:
-    def __init__(self, src_lang, tgt_lang, device_type=DEVICE, use_distilled=True):
-        self.device_type = device_type
-        self.tokenizer, self.model = self.initialize_model(src_lang, tgt_lang, use_distilled)
-
-    def initialize_model(self, src_lang, tgt_lang, use_distilled):
-        # Determine the model name based on the source and target languages and the model type
-        if src_lang.startswith("eng") and not tgt_lang.startswith("eng"):
-            model_name = "ai4bharat/indictrans2-en-indic-dist-200M" if use_distilled else "ai4bharat/indictrans2-en-indic-1B"
-        elif not src_lang.startswith("eng") and tgt_lang.startswith("eng"):
-            model_name = "ai4bharat/indictrans2-indic-en-dist-200M" if use_distilled else "ai4bharat/indictrans2-indic-en-1B"
-        elif not src_lang.startswith("eng") and not tgt_lang.startswith("eng"):
-            model_name = "ai4bharat/indictrans2-indic-indic-dist-320M" if use_distilled else "ai4bharat/indictrans2-indic-indic-1B"
-        else:
-            raise ValueError("Invalid language combination: English to English translation is not supported.")
-        # Now model_name contains the correct model based on the source and target languages
-        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        model = AutoModelForSeq2SeqLM.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-            torch_dtype=torch.float16, # performance might slightly vary for bfloat16
-            attn_implementation="flash_attention_2"
-        ).to(self.device_type)
-        return tokenizer, model
-
-class ModelManager:
-    def __init__(self, device_type=DEVICE, use_distilled=True, is_lazy_loading=False):
-        self.models: Dict[str, TranslateManager] = {}
-        self.device_type = device_type
-        self.use_distilled = use_distilled
-        self.is_lazy_loading = is_lazy_loading
-        if not is_lazy_loading:
-            self.preload_models()
-
-    def preload_models(self):
-        # Preload all models at startup
-        self.models['eng_indic'] = TranslateManager('eng_Latn', 'kan_Knda', self.device_type, self.use_distilled)
-        self.models['indic_eng'] = TranslateManager('kan_Knda', 'eng_Latn', self.device_type, self.use_distilled)
-        self.models['indic_indic'] = TranslateManager('kan_Knda', 'hin_Deva', self.device_type, self.use_distilled)
-
-    def get_model(self, src_lang, tgt_lang) -> TranslateManager:
-        if src_lang.startswith("eng") and not tgt_lang.startswith("eng"):
-            key = 'eng_indic'
-        elif not src_lang.startswith("eng") and tgt_lang.startswith("eng"):
-            key = 'indic_eng'
-        elif not src_lang.startswith("eng") and not tgt_lang.startswith("eng"):
-            key = 'indic_indic'
-        else:
-            raise ValueError("Invalid language combination: English to English translation is not supported.")
-        if key not in self.models:
-            if self.is_lazy_loading:
-                if key == 'eng_indic':
-                    self.models[key] = TranslateManager('eng_Latn', 'kan_Knda', self.device_type, self.use_distilled)
-                elif key == 'indic_eng':
-                    self.models[key] = TranslateManager('kan_Knda', 'eng_Latn', self.device_type, self.use_distilled)
-                elif key == 'indic_indic':
-                    self.models[key] = TranslateManager('kan_Knda', 'hin_Deva', self.device_type, self.use_distilled)
-            else:
-                raise ValueError(f"Model for {key} is not preloaded and lazy loading is disabled.")
-        return self.models[key]
-
-# Initialize IndicProcessor
-ip = IndicProcessor(inference=True)
-
-# Initialize FastAPI app
-
 # Initialize ASR and Translation Model Managers
 asr_manager = ASRModelManager()
 model_manager = ModelManager()
+tts_model_manager = TTSModelManager()
 
 # Define the response models
 class TranscriptionResponse(BaseModel):
@@ -244,69 +64,6 @@ class TranslationResponse(BaseModel):
 def get_translate_manager(src_lang: str, tgt_lang: str) -> TranslateManager:
     return model_manager.get_model(src_lang, tgt_lang)
 
-
-# TTS Integration
-if torch.cuda.is_available():
-    device = "cuda:0"
-    logger.info("GPU will be used for inference")
-else:
-    device = "cpu"
-    logger.info("CPU will be used for inference")
-torch_dtype = torch.float16 if device != "cpu" else torch.float32
-
-# Check CUDA availability and version
-cuda_available = torch.cuda.is_available()
-cuda_version = torch.version.cuda if cuda_available else None
-if torch.cuda.is_available():
-    device = torch.cuda.current_device()
-    capability = torch.cuda.get_device_capability(device)
-    compute_capability_float = float(f"{capability[0]}.{capability[1]}")
-    print(f"CUDA version: {cuda_version}")
-    print(f"CUDA Compute Capability: {compute_capability_float}")
-else:
-    print("CUDA is not available on this system.")
-
-class TTSModelManager:
-    def __init__(self):
-        self.model_tokenizer: OrderedDict[
-            str, tuple[ParlerTTSForConditionalGeneration, AutoTokenizer]
-        ] = OrderedDict()
-
-    def load_model(
-        self, model_name: str
-    ) -> tuple[ParlerTTSForConditionalGeneration, AutoTokenizer]:
-        logger.debug(f"Loading {model_name}...")
-        start = perf_counter()
-        model = ParlerTTSForConditionalGeneration.from_pretrained(model_name).to(
-            device,
-            dtype=torch_dtype,
-        )
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        description_tokenizer = AutoTokenizer.from_pretrained(model.config.text_encoder._name_or_path)
-        logger.info(
-            f"Loaded {model_name} and tokenizer in {perf_counter() - start:.2f} seconds"
-        )
-        return model, tokenizer, description_tokenizer
-
-    def get_or_load_model(
-        self, model_name: str
-    ) -> tuple[ParlerTTSForConditionalGeneration, Any]:
-        if model_name not in self.model_tokenizer:
-            logger.info(f"Model {model_name} isn't already loaded")
-            if len(self.model_tokenizer) == config.max_models:
-                logger.info("Unloading the oldest loaded model")
-                del self.model_tokenizer[next(iter(self.model_tokenizer))]
-            self.model_tokenizer[model_name] = self.load_model(model_name)
-        return self.model_tokenizer[model_name]
-
-tts_model_manager = TTSModelManager()
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    if not config.lazy_load_model:
-        tts_model_manager.get_or_load_model(config.model)
-    yield
-
 app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
@@ -320,7 +77,6 @@ app.add_middleware(
 @app.get("/api/test")
 def test_endpoint():
     return {"message": "Hello from FastAPI"}
-    
 
 def create_in_memory_zip(file_data):
     in_memory_zip = io.BytesIO()
@@ -353,16 +109,16 @@ async def generate_audio(
         )
     start = perf_counter()
     # Tokenize the voice description
-    input_ids = description_tokenizer(voice, return_tensors="pt").input_ids.to(device)
+    input_ids = description_tokenizer(voice, return_tensors="pt").input_ids.to(DEVICE)
     # Tokenize the input text
-    prompt_input_ids = tokenizer(input, return_tensors="pt").input_ids.to(device)
+    prompt_input_ids = tokenizer(input, return_tensors="pt").input_ids.to(DEVICE)
     # Generate the audio
     generation = tts.generate(
         input_ids=input_ids, prompt_input_ids=prompt_input_ids
     ).to(torch.float32)
     audio_arr = generation.cpu().numpy().squeeze()
     # Ensure device is a string
-    device_str = str(device)
+    device_str = str(DEVICE)
     logger.info(
         f"Took {perf_counter() - start:.2f} seconds to generate audio for {len(input.split())} words using {device_str.upper()}"
     )
@@ -434,7 +190,6 @@ async def generate_audio_batch(
         f"Took {perf_counter() - start:.2f} seconds to generate audio"
     )
     return StreamingResponse(in_memory_zip, media_type="application/zip")
-
 
 @app.post("/translate", response_model=TranslationResponse)
 async def translate(request: TranslationRequest, translate_manager: TranslateManager = Depends(get_translate_manager)):
@@ -624,7 +379,6 @@ async def transcribe_audio_batch(files: List[UploadFile] = File(...), language: 
 
     return JSONResponse(content={"transcriptions": transcriptions})
 
-
 @app.get("/")
 async def home():
     return RedirectResponse(url="/docs")
@@ -648,7 +402,7 @@ if __name__ == "__main__":
     is_lazy_loading = args.is_lazy_loading
 
     # Initialize the model managers
-    #asr_manager = ASRModelManager(default_language=args.asr_language, device_type=device_type)
+    asr_manager = ASRModelManager(default_language=args.asr_language, device_type=device_type)
     model_manager = ModelManager(device_type, use_distilled, is_lazy_loading)
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
