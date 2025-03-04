@@ -48,12 +48,18 @@ def get_endpoint(use_gpu, use_localhost, service_type):
             "translate": 8860,
             "tts": 9860  # Added TTS service port
         }
-        base_url = f'http://localhost:{port_mapping[service_type]}'
+        base_url = f'http://localhost:7860'
     else:
         base_url = f'https://gaganyatri-translate-indic-server-cpu.hf.space'
     logging.info(f"Endpoint for {service_type}: {base_url}")
     return base_url
 
+def chunk_text(text, chunk_size):
+    words = text.split()
+    chunks = []
+    for i in range(0, len(words), chunk_size):
+        chunks.append(' '.join(words[i:i + chunk_size]))
+    return chunks
 
 def translate_text(transcription, src_lang, tgt_lang, use_gpu=False, use_localhost=False):
     logging.info(f"Translating text: {transcription}, src_lang: {src_lang}, tgt_lang: {tgt_lang}, use_gpu: {use_gpu}, use_localhost: {use_localhost}")
@@ -64,8 +70,12 @@ def translate_text(transcription, src_lang, tgt_lang, use_gpu=False, use_localho
         'accept': 'application/json',
         'Content-Type': 'application/json'
     }
+
+    chunk_size =15
+    chunked_text = chunk_text(transcription, chunk_size=chunk_size)
+
     data = {
-        "sentences": [transcription],
+        "sentences": chunked_text,
         "src_lang": src_lang,
         "tgt_lang": tgt_lang
     }
@@ -73,7 +83,10 @@ def translate_text(transcription, src_lang, tgt_lang, use_gpu=False, use_localho
         response = requests.post(url, headers=headers, data=json.dumps(data))
         response.raise_for_status()
         logging.info(f"Translation successful: {response.json()}")
-        return response.json()
+
+        translated_texts = response.json().get('translations', [])
+        merged_translated_text = ' '.join(translated_texts)
+        return {'translations': [merged_translated_text]}
     except requests.exceptions.RequestException as e:
         logging.error(f"Translation failed: {e}")
         return {"translations": [""]}
@@ -104,7 +117,7 @@ with gr.Blocks(title="Dhwani Translate - Convert to any Language") as demo:
     translation_output = gr.Textbox(label="Translated Text", interactive=False)
 
 
-    use_gpu_checkbox = gr.Checkbox(label="Use GPU", value=True, interactive=False, visible=False)
+    use_gpu_checkbox = gr.Checkbox(label="Use GPU", value=False, interactive=False, visible=False)
     use_localhost_checkbox = gr.Checkbox(label="Use Localhost", value=False, interactive=False, visible=False)
     #resubmit_button = gr.Button(value="Resubmit Translation")
 

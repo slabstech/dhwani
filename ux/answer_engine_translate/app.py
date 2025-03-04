@@ -72,6 +72,13 @@ def transcribe_audio(audio_path, use_gpu, use_localhost):
         logging.error(f"Transcription failed: {e}")
         return ""
 
+def chunk_text(text, chunk_size):
+    words = text.split()
+    chunks = []
+    for i in range(0, len(words), chunk_size):
+        chunks.append(' '.join(words[i:i + chunk_size]))
+    return chunks
+
 def translate_text(transcription, src_lang, tgt_lang, use_gpu=False, use_localhost=False):
     logging.info(f"Translating text: {transcription}, src_lang: {src_lang}, tgt_lang: {tgt_lang}, use_gpu: {use_gpu}, use_localhost: {use_localhost}")
     base_url = get_endpoint(use_gpu, use_localhost, "translate")
@@ -81,16 +88,23 @@ def translate_text(transcription, src_lang, tgt_lang, use_gpu=False, use_localho
         'accept': 'application/json',
         'Content-Type': 'application/json'
     }
+
+    chunk_size =15
+    chunked_text = chunk_text(transcription, chunk_size=chunk_size)
+
     data = {
-        "sentences": [transcription],
+        "sentences": chunked_text,
         "src_lang": src_lang,
         "tgt_lang": tgt_lang
     }
+    
     try:
         response = requests.post(url, headers=headers, data=json.dumps(data))
         response.raise_for_status()
         logging.info(f"Translation successful: {response.json()}")
-        return response.json()
+        translated_texts = response.json().get('translations', [])
+        merged_translated_text = ' '.join(translated_texts)
+        return {'translations': [merged_translated_text]}
     except requests.exceptions.RequestException as e:
         logging.error(f"Translation failed: {e}")
         return {"translations": [""]}
